@@ -309,5 +309,129 @@ def test_reregister_verdict_incomplete_until_recompacted():
         shutil.rmtree(d, ignore_errors=True)
 
 
+GEN1_ARTS = [
+    {"name": "工件A", "fragments": [HEAD, "光谱基线 L=550", TAIL]},
+    {"name": "工件B", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+]
+GEN2_ARTS = GEN1_ARTS + [
+    {"name": "工件C", "fragments": ["新增片段 ZZZ"]},
+]
+
+
+def run_two_generations(store, did, cid1="CID-HIST-1", cid2="CID-HIST-2"):
+    """Two consecutive generations on one drill (2 artifacts, then 3)."""
+    first = store.compact(did, cid1)
+    assert first["generation"] == 1
+    seg_v1 = store._read_current(did)["segment"]
+    store.re_register_artifacts(did, GEN2_ARTS)
+    second = store.compact(did, cid2)
+    assert second["generation"] == 2
+    return seg_v1
+
+
+def test_historical_cid_retransmit_after_reopen_keeps_active_catalog():
+    """两代整理 + 保留数据重开 + 重新登记首代工件 + 重传首代标识：
+    必须返回首代冻结结果，不新建段/代次，活动目录不倒退。"""
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did = make_drill(st)  # 两份工件的第一代
+        seg_v1 = run_two_generations(st, did)
+        assert "CID-HIST-1" in st.registry["bindings"]  # 绑定永久保留
+
+        # 保留数据卷重开服务（新 Store = 进程重启）
+        st2 = reopen(d)
+        assert st2._read_current(did)["generation"] == 2
+        segs_after_reopen = list_segments(st2)
+        assert seg_v1 not in segs_after_reopen  # 首代段已被安全清扫
+
+        # 重新登记回第一代工件内容，重传最早的整理标识
+        st2.re_register_artifacts(did, GEN1_ARTS)
+        again = st2.compact(did, "CID-HIST-1")
+        assert again["status"] == "active"
+        assert again["generation"] == 1  # 首代冻结结果
+        assert again["retransmission"] is True
+        # 没有额外代次、段集合不增长、活动目录不倒退
+        assert [g["generation"] for g in st2.drill_view(did)["generations"]] == [1, 2]
+        assert list_segments(st2) == segs_after_reopen
+        assert st2._read_current(did)["generation"] == 2
+        # 第二代目录及其审计历史未被历史重传改变
+        statuses = {g["generation"]: g["status"]
+                    for g in st2.drill_view(did)["generations"]}
+        assert statuses == {1: "retired", 2: "active"}
+        # 首代标识与首次工件摘要、代次、段的关联不可变
+        binding = st2.registry["bindings"]["CID-HIST-1"]
+        assert binding["generation"] == 1
+        assert binding["segment"] == seg_v1
+        assert binding["digest_rows"] == st2.digest_rows(
+            [st2._normalise_artifact(a) for a in GEN1_ARTS]
+        )
+
+        # 再次重开后重传仍然稳定（关联已持久化）
+        st3 = reopen(d)
+        again2 = st3.compact(did, "CID-HIST-1")
+        assert again2["generation"] == 1
+        assert st3._read_current(did)["generation"] == 2
+        assert list_segments(st3) == segs_after_reopen
+        assert [g["generation"] for g in st3.drill_view(did)["generations"]] == [1, 2]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_historical_cid_retransmit_with_different_content_rejected():
+    """首代标识配合不同工件内容：保留当前活动目录并给出既有拒因。"""
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did = make_drill(st)
+        run_two_generations(st, did)
+        st2 = reopen(d)
+        assert st2._read_current(did)["generation"] == 2
+        segs = list_segments(st2)
+
+        # 同标识 + 不同工件集合（名称不同）→ artifact_set_mismatch
+        st2.re_register_artifacts(did, [
+            {"name": "工件甲", "fragments": [HEAD, "光谱基线 L=550", TAIL]},
+            {"name": "工件乙", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+        ])
+        with pytest.raises(Rejected) as ei:
+            st2.compact(did, "CID-HIST-1")
+        assert ei.value.code == "artifact_set_mismatch"
+        assert st2._read_current(did)["generation"] == 2
+
+        # 同标识 + 集合形状相同但片段内容不同 → fragment_digest_mismatch
+        st2.re_register_artifacts(did, [
+            {"name": "工件A", "fragments": [HEAD, "被篡改的片段", TAIL]},
+            {"name": "工件B", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+        ])
+        with pytest.raises(Rejected) as ei:
+            st2.compact(did, "CID-HIST-1")
+        assert ei.value.code == "fragment_digest_mismatch"
+        # 活动目录、代次集合与段集合均未受影响
+        assert st2._read_current(did)["generation"] == 2
+        assert [g["generation"] for g in st2.drill_view(did)["generations"]] == [1, 2]
+        assert list_segments(st2) == segs
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_current_cid_retransmit_still_repairs_segment_after_gen2():
+    """第二代自己的标识重传仍是普通幂等路径（非历史路径）。"""
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did = make_drill(st)
+        run_two_generations(st, did)
+        st2 = reopen(d)
+        segs = list_segments(st2)
+        again = st2.compact(did, "CID-HIST-2")
+        assert again["generation"] == 2
+        assert not again.get("historical")
+        assert list_segments(st2) == segs
+        assert st2._read_current(did)["generation"] == 2
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def read_wal(store, cid):
     return json.load(open(store._wal_path(cid), encoding="utf-8"))

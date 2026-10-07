@@ -124,6 +124,9 @@ def compact(drill_id: str, payload: CompactRequest) -> JSONResponse:
             "consolidation_id": result["consolidation_id"],
             "generation": result["generation"],
             "retransmission": result.get("retransmission", False),
+            # True when the id resolved to a frozen historical result: the
+            # active catalog is a newer generation and was left untouched.
+            "historical": result.get("historical", False),
             "swept": result.get("swept", []),
             "previous_generation": result.get("previous_generation"),
             "drill": view,

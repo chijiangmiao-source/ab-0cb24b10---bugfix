@@ -15,6 +15,11 @@ Checks, in order:
          -> reopen converges and sweeps the old segment
        - retransmission with the same consolidation id creates no new
          segment and changes no result
+       - historical retransmission after a reopen: re-registering the
+         first-generation artifacts and retransmitting the first id returns
+         the frozen gen-1 result — no new segment, no new generation, and
+         the active catalog does not move backwards; the same id with
+         different content is rejected with the existing reason
        - the three rejection reasons keep the active catalog:
          artifact set mismatch, fragment digest mismatch, missing segment
   4. recovery & retransmission verdicts are asserted from the live responses
@@ -285,6 +290,60 @@ def check_smoke(c: Client) -> bool:
     else:
         passed &= fail("第 2 代重传非幂等")
 
+    # ---- historical retransmission across a service reopen --------------
+    # Generations 1 (cid) and 2 (cid2) completed above and every catalog is
+    # complete. Reopen with the data volume preserved, re-register the
+    # first-generation artifacts, then retransmit the first-generation id:
+    # it must return the frozen gen-1 result — no new segment, no new
+    # generation, and the active catalog must not move backwards.
+    _, rep = c.post("/api/admin/reopen", {})
+    _, pre = c.get(f"/api/drills/{did}")
+    c.put(f"/api/drills/{did}/artifacts", drill_body, expect=200)
+    code, hist = c.call("POST", f"/api/drills/{did}/compact",
+                        {"consolidation_id": cid})
+    _, hv = c.get(f"/api/drills/{did}")
+    if (rep.get("recovered") == [] and rep.get("swept") == []
+            and code == 200
+            and hist["generation"] == 1
+            and hist.get("retransmission") is True
+            and hist.get("historical") is True
+            and hv["active_generation"] == 2
+            and hv["segments"] == pre["segments"]
+            and [g["generation"] for g in hv["generations"]] == [1, 2]
+            and {g["generation"]: g["status"] for g in hv["generations"]}
+                == {1: "retired", 2: "active"}):
+        ok("保留数据重开后重传首代标识：返回首代冻结结果，无新段/新代次，活动目录保持第 2 代")
+    else:
+        passed &= fail(
+            "历史标识重传破坏了与首代结果的不可变关联",
+            f"reopen={json.dumps(rep)}\ncode={code} hist={json.dumps(hist)[:200]}\n"
+            f"active={hv['active_generation']} segs={hv['segments']}\n"
+            f"gens={[(g['generation'], g['status']) for g in hv['generations']]}",
+        )
+
+    # same first-generation id + different artifact content: the current
+    # active catalog is retained and the existing rejection reason returned
+    tampered = {
+        "name": drill_body["name"],
+        "artifacts": [
+            {"name": "光谱校准帧", "fragments": [f"帧头-{tag}", "光谱 550", "帧尾-9F"]},
+            {"name": "地形条带A", "fragments": [f"帧头-{tag}", f"被篡改-{tag}", "帧尾-9F"]},
+            {"name": "云量速报", "fragments": [f"帧头-{tag}", "云量 18%", "帧尾-9F"]},
+        ],
+    }
+    c.put(f"/api/drills/{did}/artifacts", tampered, expect=200)
+    code, r5 = c.call("POST", f"/api/drills/{did}/compact",
+                      {"consolidation_id": cid})
+    if (code == 409 and r5["reject"]["code"] == "fragment_digest_mismatch"
+            and r5["drill"]["active_generation"] == 2):
+        ok("首代标识异内容重传：409 既有拒因，活动目录（第 2 代）保留")
+    else:
+        passed &= fail("首代标识异内容重传未被正确拒绝",
+                       f"code={code} body={json.dumps(r5)[:300]}")
+
+    # restore the second-generation artifact set so the drill converges again
+    c.put(f"/api/drills/{did}/artifacts", changed, expect=200)
+
     # ---- rejection rules: active catalog retained, first reason returned
     # reason 1: artifact set mismatch
     other = {
@@ -371,8 +430,15 @@ def check_smoke(c: Client) -> bool:
 
     step("4/4 恢复与重传结果核对")
     _, rec = c.get("/api/recovery")
-    if cid2 in rec.get("recovered", []) and isinstance(rec.get("swept"), list):
-        ok(f"最近恢复报告：recovered={rec['recovered']} swept={rec['swept']}")
+    # The most recent reopen is the historical-retransmission one above: a
+    # clean convergence with nothing left to recover or sweep. (cid/cid2
+    # recovery evidence was asserted at their own reopen steps.)
+    if (rec.get("reopened_at")
+            and isinstance(rec.get("recovered"), list)
+            and isinstance(rec.get("retransmitted"), list)
+            and isinstance(rec.get("swept"), list)):
+        ok(f"最近恢复报告结构完整：recovered={rec['recovered']} "
+           f"retransmitted={rec['retransmitted']} swept={rec['swept']}")
     else:
         passed &= fail("恢复报告内容不符", json.dumps(rec, ensure_ascii=False))
     # missing-segment rejection is exercised at engine level by pytest;

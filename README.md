@@ -24,7 +24,12 @@
      segments_written→switched→done），缺失的段按**内容寻址**以**同一 segid**
      重传，绝不新建段，随后完成切换/清扫。
 5. **重传幂等**：整理标识 + 工件集合 + 片段摘要决定唯一段；同一标识重传返回同一
-   代次、同一段、同一结果。
+   代次、同一段、同一结果。**绑定永久不可变**：标识一旦成功就长期代表其首次冻结
+   的工件集合与整理结果，后续代次只把旧标识标记为退役（审计保留），绝不删除绑定。
+   即使保留数据卷重开服务后，重新登记回首代工件并重传最早标识，也只返回首代的
+   冻结结果（`historical: true`）——不新建段、不新增目录代次、活动目录不倒退，
+   后续代次目录及其审计历史不受历史重传影响；同标识配合不同工件内容时仍保留当前
+   活动目录并返回既有拒因（HTTP 409）。
 6. **三类拒因（保留原活动目录，返回首个拒因，HTTP 409）**
    - `artifact_set_mismatch`：整理标识已绑定**不同工件集合**；
    - `fragment_digest_mismatch`：集合形状相同但**片段摘要不符**；
@@ -63,7 +68,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 DATA_DIR=.runtime-data .venv/bin/python -m uvicorn app.main:app --port 8080
 .venv/bin/python scripts/verify.py     # 会自动拉起临时服务做全量核对
-.venv/bin/python -m pytest tests -q    # 仅跑代码测试（17 项）
+.venv/bin/python -m pytest tests -q    # 仅跑代码测试（22 项）
 ```
 
 ## 网页操作流
@@ -75,7 +80,9 @@ DATA_DIR=.runtime-data .venv/bin/python -m uvicorn app.main:app --port 8080
    **恢复裁决**（complete / 缺失片段 / 是否发生重传）；
 4. 「模拟重开」后视图收敛为一份完整目录；同标识「重传」不产生新段；
 5. 「把编辑器内容重新登记到所选演练」后，裁决变为不完整且旧目录保留；用**新的
-   整理标识**再压缩即产生下一代，旧段在验证全部可重组后才被清扫。
+   整理标识**再压缩即产生下一代，旧段在验证全部可重组后才被清扫。此后再重新登记
+   回旧内容并重传**旧标识**，返回的是该标识首次冻结的历史结果（页面标注「历史
+   结果 · 活动代次不变」），不会新建段或代次，也不会让活动目录倒退。
 
 ## 主要 API
 

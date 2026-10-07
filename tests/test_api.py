@@ -196,6 +196,108 @@ def test_rejection_first_reason_returned_and_active_retained(client):
     assert r1.json()["drill"]["active_generation"] is None
 
 
+def test_historical_cid_retransmit_after_service_restart(client):
+    """连续两代整理 → 保留数据重开服务 → 重新登记首代工件 → 重传首代标识。
+
+    重传必须返回首代冻结结果：不产生额外代次、段集合不增长、活动目录
+    不倒退；同标识配合不同工件内容时给出既有拒因且目录保留。
+    """
+    c, data_dir, main = client
+    gen1_payload = {
+        "name": "两代演练",
+        "artifacts": [
+            {"name": "工件A", "fragments": ["帧头-G", "光谱 550", "帧尾-G"]},
+            {"name": "工件B", "fragments": ["帧头-G", "地形 A1", "帧尾-G"]},
+        ],
+    }
+    drill = create(c, gen1_payload)
+    did = drill["id"]
+    r1 = c.post(f"/api/drills/{did}/compact",
+                json={"consolidation_id": "CID-API-G1"})
+    assert r1.status_code == 200 and r1.json()["generation"] == 1
+
+    # 重新登记不同内容并完成第二代整理
+    gen2_payload = {
+        "name": "两代演练",
+        "artifacts": gen1_payload["artifacts"] + [
+            {"name": "工件C", "fragments": ["全新片段 ZZZ"]},
+        ],
+    }
+    c.put(f"/api/drills/{did}/artifacts",
+          json=gen2_payload).raise_for_status()
+    r2 = c.post(f"/api/drills/{did}/compact",
+                json={"consolidation_id": "CID-API-G2"})
+    assert r2.json()["generation"] == 2
+
+    # 保留数据卷重开服务：同一 DATA_DIR 上重新加载应用（等价于进程重启）
+    importlib.reload(main)
+    with TestClient(main.app) as c2:
+        view = c2.get(f"/api/drills/{did}").json()
+        assert view["active_generation"] == 2
+        segs = view["segments"]
+        assert len(segs) == 1  # 首代段已在重开收敛时清扫
+
+        # 重新登记首代工件内容，重传最早的整理标识
+        c2.put(f"/api/drills/{did}/artifacts",
+               json=gen1_payload).raise_for_status()
+        r3 = c2.post(f"/api/drills/{did}/compact",
+                     json={"consolidation_id": "CID-API-G1"})
+        assert r3.status_code == 200, r3.text
+        body = r3.json()
+        assert body["generation"] == 1          # 首代冻结结果
+        assert body["retransmission"] is True
+        assert body["historical"] is True
+        after = c2.get(f"/api/drills/{did}").json()
+        assert after["active_generation"] == 2  # 活动目录不倒退
+        assert after["segments"] == segs        # 段集合不增长
+        assert [g["generation"] for g in after["generations"]] == [1, 2]
+        assert {g["generation"]: g["status"] for g in after["generations"]} == \
+            {1: "retired", 2: "active"}
+
+    # 再次重开后重传依旧稳定（绑定已持久化）
+    importlib.reload(main)
+    with TestClient(main.app) as c3:
+        r4 = c3.post(f"/api/drills/{did}/compact",
+                     json={"consolidation_id": "CID-API-G1"})
+        assert r4.json()["generation"] == 1
+        view4 = c3.get(f"/api/drills/{did}").json()
+        assert view4["active_generation"] == 2
+        assert view4["segments"] == segs
+
+        # 首代标识 + 同形状异内容 → 既有拒因，活动目录保留
+        tampered = {
+            "name": "两代演练",
+            "artifacts": [
+                {"name": "工件A", "fragments": ["帧头-G", "被篡改", "帧尾-G"]},
+                {"name": "工件B", "fragments": ["帧头-G", "地形 A1", "帧尾-G"]},
+            ],
+        }
+        c3.put(f"/api/drills/{did}/artifacts", json=tampered).raise_for_status()
+        r5 = c3.post(f"/api/drills/{did}/compact",
+                     json={"consolidation_id": "CID-API-G1"})
+        assert r5.status_code == 409
+        assert r5.json()["reject"]["code"] == "fragment_digest_mismatch"
+        assert r5.json()["drill"]["active_generation"] == 2
+
+        # 首代标识 + 不同工件集合 → artifact_set_mismatch
+        renamed = {
+            "name": "两代演练",
+            "artifacts": [
+                {"name": "别的工件", "fragments": ["帧头-G", "光谱 550", "帧尾-G"]},
+                {"name": "工件B", "fragments": ["帧头-G", "地形 A1", "帧尾-G"]},
+            ],
+        }
+        c3.put(f"/api/drills/{did}/artifacts", json=renamed).raise_for_status()
+        r6 = c3.post(f"/api/drills/{did}/compact",
+                     json={"consolidation_id": "CID-API-G1"})
+        assert r6.status_code == 409
+        assert r6.json()["reject"]["code"] == "artifact_set_mismatch"
+        assert r6.json()["drill"]["active_generation"] == 2
+        final = c3.get(f"/api/drills/{did}").json()
+        assert final["segments"] == segs
+        assert [g["generation"] for g in final["generations"]] == [1, 2]
+
+
 def test_hard_crash_mode_process_restart(tmp_path, monkeypatch):
     """Hard mode exits the process; restarting must converge."""
     import subprocess

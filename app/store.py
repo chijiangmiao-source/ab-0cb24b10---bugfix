@@ -564,7 +564,13 @@ class Store:
         consolidation_id: str,
         fragment_bytes: Dict[str, bytes],
     ) -> Dict[str, Any]:
-        """Reuse of a known consolidation id: validate, never duplicate."""
+        """Reuse of a known consolidation id: validate, never duplicate.
+
+        A binding is immutable and survives later generations and service
+        reopens. Retransmitting an id whose generation has been superseded
+        returns the frozen historical result without touching segments,
+        catalog files or the active pointer.
+        """
         artifacts = [self._normalise_artifact(a) for a in drill["artifacts"]]
         # A consolidation id names exactly one drill's artifact set.
         if binding.get("drill_id") != drill["id"]:
@@ -588,6 +594,21 @@ class Store:
                 "active catalog retained",
                 "fragment_digest_mismatch",
             )
+        cat = self._read_current(drill["id"])
+        if cat is not None and cat["generation"] > binding["generation"]:
+            # Historical binding: a newer generation is already active. The
+            # id still resolves to the result it froze first, but the
+            # retransmission is a pure lookup — it creates no segment, writes
+            # no catalog generation and never moves the active pointer
+            # backwards. The retired generation's catalog and audit trail
+            # stay exactly as they were.
+            return {
+                "status": "active",
+                "consolidation_id": consolidation_id,
+                "generation": binding["generation"],
+                "retransmission": True,
+                "historical": True,
+            }
         # Rejection reason #3: a required segment is missing and cannot be
         # retransmitted because its bytes are unavailable locally.
         segid = binding["segment"]
@@ -601,8 +622,7 @@ class Store:
             if wrote:
                 self.last_recovery["retransmitted"].append(segid)
 
-        cat = self._read_current(drill["id"])
-        if cat is None:
+        if cat is None or cat["generation"] < binding["generation"]:
             # Catalog pointer lost while the binding survived: republish it
             # from the durable binding instead of creating anything new.
             cat = self._repair_from_binding(
@@ -705,7 +725,13 @@ class Store:
             "artifact_names": wal["artifact_names"],
             "digest_rows": wal["digest_rows"],
         }
-        stale_bindings = [
+        # Consolidation-id bindings are immutable and permanent: once an id
+        # has succeeded it forever names the artifact set, generation and
+        # segment it froze first. Superseded ids are only *marked* retired
+        # for audit — the binding itself is never deleted — so a historical
+        # retransmission (even after a service reopen) still resolves to the
+        # frozen result instead of starting a new generation.
+        superseded = [
             cid
             for cid, entry in self.registry["bindings"].items()
             if (
@@ -714,12 +740,15 @@ class Store:
             )
         ]
         retired_consolidations = drill.setdefault("retired_consolidations", [])
-        for cid in stale_bindings:
-            retired_consolidations.append({
-                "consolidation_id": cid,
-                "retired_at": utc_now(),
-            })
-            del self.registry["bindings"][cid]
+        already_retired = {
+            entry["consolidation_id"] for entry in retired_consolidations
+        }
+        for cid in superseded:
+            if cid not in already_retired:
+                retired_consolidations.append({
+                    "consolidation_id": cid,
+                    "retired_at": utc_now(),
+                })
         if len(retired_consolidations) > 8:
             drill["retired_consolidations"] = retired_consolidations[-8:]
         # Compact storage: source fragment text leaves the registry now that

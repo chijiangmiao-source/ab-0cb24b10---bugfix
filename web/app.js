@@ -278,8 +278,14 @@ async function runCompact(cid, crashAfter) {
       consolidation_id: cid,
       crash_after: crashAfter,
     });
+    const activeGen = res.drill ? res.drill.active_generation : null;
+    const historical = Boolean(res.historical) || (
+      res.generation != null && activeGen != null && res.generation !== activeGen
+    );
     box.innerHTML = `<span class="ok">✓ 压缩完成</span>
-      <span class="tag active pill">第 ${res.generation} 代活动</span>
+      ${historical
+        ? `<span class="tag reused pill">第 ${res.generation} 代历史结果 · 活动代次仍为第 ${activeGen} 代</span>`
+        : `<span class="tag active pill">第 ${res.generation} 代活动</span>`}
       ${res.retransmission ? '<span class="tag reused pill">重传幂等 · 未新建段</span>' : ""}
       ${res.swept?.length
         ? `<span class="muted pill">已清扫旧段：${res.swept.join(", ")}</span>`
