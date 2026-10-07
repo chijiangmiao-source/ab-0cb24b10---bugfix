@@ -1,0 +1,53 @@
+# Ground imaging station compact-storage drill.
+#
+#   web    — FastAPI host + page; host port comes from HOST_PORT (default 8080)
+#   verify — one-shot service: recovery/retransmission checks, pytest, build
+#            and API/HTTP smoke against the live web service. Exits 0/1.
+#
+# Try:
+#   docker compose up web
+#   docker compose run --rm verify
+#
+services:
+  web:
+    build: .
+    image: ground-station-compact:latest
+    environment:
+      DATA_DIR: /data
+      CRASH_MODE: ${CRASH_MODE:-soft}
+    ports:
+      # host port is configured here; the container always listens on 8080
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - station-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    image: ground-station-compact:latest
+    build: .
+    command: ["python", "scripts/verify.py"]
+    environment:
+      BASE_URL: http://web:8080
+      DATA_DIR: /data
+      CRASH_MODE: soft
+    depends_on:
+      web:
+        condition: service_healthy
+    # shares the volume so the missing-segment rejection can be exercised
+    # against the live service's own data directory
+    volumes:
+      - station-data:/data
+    restart: "no"
+
+volumes:
+  station-data:

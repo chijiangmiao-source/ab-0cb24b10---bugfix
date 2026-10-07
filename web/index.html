@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>地面成像站 · 紧凑存储演练</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<header>
+  <h1>地面成像站 · 共享片段紧凑存储</h1>
+  <div id="health" class="badge">健康检查中…</div>
+</header>
+
+<main>
+  <section class="panel" id="create-panel">
+    <h2>1. 建立演练（2–8 份工件）</h2>
+    <div class="row">
+      <label>演练名称 <input id="drill-name" value="晨间过境演练" /></label>
+      <button id="add-artifact" type="button">＋ 增加工件</button>
+      <button id="seed-demo" type="button" class="ghost">填入示例（含重复片段）</button>
+    </div>
+    <div id="artifacts-editor"></div>
+    <p class="hint">每份工件由可重复引用的短文本片段<strong>按顺序</strong>组成；相同文本自动共享同一片段（内容寻址）。</p>
+    <button id="create-drill" class="primary" type="button">创建演练（API 持久化）</button>
+    <span id="create-error" class="error"></span>
+  </section>
+
+  <section class="panel" id="drills-panel">
+    <h2>2. 演练与整理代次</h2>
+    <div class="row">
+      <select id="drill-select"></select>
+      <button id="refresh" type="button">刷新</button>
+      <button id="reregister" type="button">把编辑器内容重新登记到所选演练</button>
+      <button id="reopen" type="button" class="warn">⚡ 模拟重开（断电后收敛）</button>
+    </div>
+    <div id="crash-banner" class="banner hidden"></div>
+
+    <div id="drill-detail" class="muted">尚未选择演练。</div>
+
+    <div class="compact-box">
+      <h3>3. 以稳定整理标识发起压缩</h3>
+      <div class="row">
+        <label>整理标识 <input id="cid" placeholder="例如 CID-2026-ALPHA" /></label>
+        <label>中断注入
+          <select id="crash-after">
+            <option value="none">不注入</option>
+            <option value="segments">新段落盘后断电（切换前）</option>
+            <option value="switch">目录切换后断电（清扫前）</option>
+          </select>
+        </label>
+        <button id="compact" class="primary" type="button">发起压缩</button>
+        <button id="retransmit" type="button">重传同一标识（幂等复核）</button>
+      </div>
+      <div id="compact-result"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="recovery-panel">
+    <h2>4. 最近一次重开恢复报告</h2>
+    <pre id="recovery-report" class="report">{}</pre>
+  </section>
+</main>
+
+<dialog id="reassemble-dialog">
+  <h3 id="ra-title"></h3>
+  <pre id="ra-text" class="report"></pre>
+  <form method="dialog"><button>关闭</button></form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+:root {
+  --bg: #0f1420;
+  --panel: #1a2233;
+  --line: #2c3850;
+  --text: #e8edf6;
+  --muted: #93a0b8;
+  --accent: #5aa9ff;
+  --ok: #3ecf8e;
+  --warn: #f5a623;
+  --bad: #ff6b6b;
+  --purple: #b58cff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+header {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--line);
+  background: #141b2b;
+}
+header h1 { font-size: 18px; margin: 0; }
+.badge {
+  font-size: 12px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.bad { color: var(--bad); border-color: var(--bad); }
+main { max-width: 1080px; margin: 24px auto; padding: 0 20px 60px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 18px 20px; margin-bottom: 20px;
+}
+.panel h2 { margin: 0 0 14px; font-size: 16px; }
+.panel h3 { margin: 18px 0 10px; font-size: 14px; }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+label { font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+input, select {
+  background: #10172a; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; min-width: 180px;
+}
+button {
+  background: #24304a; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #0b1020; border-color: var(--accent); font-weight: 600; }
+button.ghost { background: transparent; }
+button.warn { border-color: var(--warn); color: var(--warn); }
+.hint { font-size: 12px; color: var(--muted); }
+.error { color: var(--bad); font-size: 13px; margin-left: 10px; }
+.muted { color: var(--muted); font-size: 13px; }
+.hidden { display: none !important; }
+
+.artifact-card {
+  border: 1px dashed var(--line); border-radius: 10px;
+  padding: 12px; margin-bottom: 10px;
+}
+.artifact-card header.plain {
+  all: unset; display: flex; gap: 10px; align-items: center; margin-bottom: 8px;
+}
+.artifact-card input.name { min-width: 220px; }
+.frag-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
+.frag-row input { flex: 1; min-width: 240px; }
+.frag-row .idx { color: var(--muted); font-size: 12px; width: 34px; text-align: right; }
+.frag-row .digest { font-family: ui-monospace, monospace; font-size: 11px; color: var(--purple); }
+.banner {
+  padding: 10px 14px; border-radius: 8px; margin: 10px 0;
+  background: rgba(245,166,35,.12); border: 1px solid var(--warn); color: var(--warn);
+  font-size: 13px;
+}
+.compact-box { border-top: 1px solid var(--line); margin-top: 14px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
+.tag.active { color: var(--ok); border-color: var(--ok); }
+.tag.staged { color: var(--warn); border-color: var(--warn); }
+.tag.retired { color: var(--muted); }
+.tag.reused { color: var(--purple); border-color: var(--purple); }
+.verdict-ok { color: var(--ok); }
+.verdict-bad { color: var(--bad); }
+.report {
+  background: #0c1120; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap;
+}
+#compact-result { margin-top: 10px; font-size: 13px; }
+#compact-result .ok { color: var(--ok); }
+#compact-result .bad { color: var(--bad); }
+#compact-result .warn { color: var(--warn); }
+.pill { margin-right: 6px; }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 12px; max-width: 720px; width: 90%; }
+dialog::backdrop { background: rgba(5,8,15,.7); }
+.remove { padding: 2px 9px; font-size: 12px; }
