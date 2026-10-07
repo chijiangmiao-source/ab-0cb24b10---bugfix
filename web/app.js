@@ -278,8 +278,14 @@ async function runCompact(cid, crashAfter) {
       consolidation_id: cid,
       crash_after: crashAfter,
     });
-    box.innerHTML = `<span class="ok">✓ 压缩完成</span>
-      <span class="tag active pill">第 ${res.generation} 代活动</span>
+    const d = await api.drill(currentDrill.id);
+    const historical = res.retransmission && res.generation !== d.active_generation;
+    box.innerHTML = `<span class="ok">✓ ${historical ? "历史标识重传完成" : "压缩完成"}</span>
+      <span class="tag ${historical ? "retired" : "active"} pill">${
+        historical
+          ? `第 ${res.generation} 代冻结结果 · 活动目录仍为第 ${d.active_generation} 代`
+          : `第 ${res.generation} 代活动`
+      }</span>
       ${res.retransmission ? '<span class="tag reused pill">重传幂等 · 未新建段</span>' : ""}
       ${res.swept?.length
         ? `<span class="muted pill">已清扫旧段：${res.swept.join(", ")}</span>`
@@ -287,7 +293,6 @@ async function runCompact(cid, crashAfter) {
       ${res.previous_generation
         ? `<span class="muted pill">替代第 ${res.previous_generation} 代</span>`
         : ""}`;
-    const d = await api.drill(currentDrill.id);
     renderDetail(d);
   } catch (e) {
     if (e.status === 409) {

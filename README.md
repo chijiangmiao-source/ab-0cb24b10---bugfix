@@ -23,8 +23,12 @@
    - 重开（进程重启或 `POST /api/admin/reopen`）重放 WAL（planned→
      segments_written→switched→done），缺失的段按**内容寻址**以**同一 segid**
      重传，绝不新建段，随后完成切换/清扫。
-5. **重传幂等**：整理标识 + 工件集合 + 片段摘要决定唯一段；同一标识重传返回同一
-   代次、同一段、同一结果。
+   - 整理完成后才丢段的演练属于**降级而非不一致**：重开照常收敛其余演练，
+     在恢复报告 `degraded` 与恢复裁决中如实列出缺失片段，服务不因此拒绝启动。
+5. **整理标识一经成功即永久绑定**：标识 + 首次工件摘要 + 目录代次 + 段不可变；
+   新一代整理只把旧标识记入审计历史，**绝不删除其绑定**。服务重开后重传
+   早期标识，返回其首次冻结的代次与结果——不创建段、不新增代次、活动目录
+   不倒退，第二代目录及其审计历史不受历史重传影响。
 6. **三类拒因（保留原活动目录，返回首个拒因，HTTP 409）**
    - `artifact_set_mismatch`：整理标识已绑定**不同工件集合**；
    - `fragment_digest_mismatch`：集合形状相同但**片段摘要不符**；
@@ -36,7 +40,7 @@
 ## 数据目录布局（`DATA_DIR`，默认 `/data`）
 
 ```
-registry.json            演练、工件摘要、整理标识绑定（原子写）
+registry.json            演练、工件摘要、整理标识绑定（永久保留，原子写）
 seg/<segid>.pack|.idx    内容寻址段与偏移索引
 wal/<cid>.json           压缩 WAL（收敛驱动，完成即删）
 gen/<drill>-gen-N.json   不可变目录代次
@@ -51,7 +55,8 @@ crash.log                模拟断电记录
 HOST_PORT=8080 docker compose up web
 # 浏览器打开 http://localhost:8080
 
-# 名为 verify 的单次服务：恢复/重传核对 + pytest + 构建检查 + API/HTTP 冒烟，
+# 名为 verify 的单次服务：恢复/重传核对 + pytest + 构建检查 + API/HTTP 冒烟
+# + 历史标识重传验收（经 /api/admin/reopen 重开收敛后核对冻结结果），
 # 等待 web 健康后执行，以退出码结束（0 成功 / 1 失败）
 docker compose run --rm verify
 ```
@@ -63,7 +68,9 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 DATA_DIR=.runtime-data .venv/bin/python -m uvicorn app.main:app --port 8080
 .venv/bin/python scripts/verify.py     # 会自动拉起临时服务做全量核对
-.venv/bin/python -m pytest tests -q    # 仅跑代码测试（17 项）
+                                       # （含保留数据目录真实重开进程后的
+                                       #   历史标识重传验收）
+.venv/bin/python -m pytest tests -q    # 仅跑代码测试（23 项）
 ```
 
 ## 网页操作流
@@ -73,7 +80,9 @@ DATA_DIR=.runtime-data .venv/bin/python -m uvicorn app.main:app --port 8080
 2. 用**稳定整理标识**发起压缩，可选择在「新段落盘后」或「目录切换后」注入断电；
 3. 查看**活动代次**、每份工件的**重组摘要**、每个片段**所在段与偏移**、以及
    **恢复裁决**（complete / 缺失片段 / 是否发生重传）；
-4. 「模拟重开」后视图收敛为一份完整目录；同标识「重传」不产生新段；
+4. 「模拟重开」后视图收敛为一份完整目录；同标识「重传」不产生新段；重传
+   **早期代次**的标识时，页面标注「第 N 代冻结结果 · 活动目录仍为第 M 代」，
+   不创建段或代次、活动目录不倒退；
 5. 「把编辑器内容重新登记到所选演练」后，裁决变为不完整且旧目录保留；用**新的
    整理标识**再压缩即产生下一代，旧段在验证全部可重组后才被清扫。
 

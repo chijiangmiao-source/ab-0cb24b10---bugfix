@@ -192,6 +192,38 @@ def test_reopen_retransmits_segment_without_new_segment_id():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_reopen_with_lost_segment_reports_degraded_and_heals_on_retransmit():
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did = make_drill(st)
+        st.compact(did, "CID-DEG")
+        segid = st._read_current(did)["segment"]
+        os.remove(st._pack_paths(segid)[0])
+        os.remove(st._pack_paths(segid)[1])
+
+        # reopen with a degraded drill: the service still converges, keeps the
+        # catalog registration and reports the loss instead of refusing to boot
+        st2 = reopen(d)
+        assert did in st2.last_recovery["degraded"]
+        assert len(st2.last_recovery["degraded"][did]) == 4
+        assert st2._read_current(did) is not None
+        assert st2.recovery_verdict(did)["complete"] is False
+
+        # re-registering the source bytes lets the same id retransmit the same
+        # content-addressed segment: the catalog heals without a new generation
+        st2.re_register_artifacts(did, CONTENT_A)
+        res = st2.compact(did, "CID-DEG")
+        assert res["generation"] == 1
+        assert res["retransmission"] is True
+        assert st2._read_current(did)["segment"] == segid
+        assert segid in st2.last_recovery["retransmitted"]
+        assert st2.recovery_verdict(did)["complete"] is True
+        assert_one_complete_catalog(st2, did, 1)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_cid_cannot_be_shared_across_drills_even_with_equal_content():
     d = tempfile.mkdtemp()
     try:
@@ -311,3 +343,141 @@ def test_reregister_verdict_incomplete_until_recompacted():
 
 def read_wal(store, cid):
     return json.load(open(store._wal_path(cid), encoding="utf-8"))
+
+
+# Two-artifact content sets sharing artifact names but not fragment content.
+CONTENT_A = [
+    {"name": "工件A", "fragments": [HEAD, "光谱基线 L=550", TAIL]},
+    {"name": "工件B", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+]
+CONTENT_B = [
+    {"name": "工件A", "fragments": ["帧头V2", "光谱基线 L=640", "帧尾V2"]},
+    {"name": "工件B", "fragments": ["帧头V2", "地形条带 B4 起伏 -1.1m", "帧尾V2"]},
+]
+
+
+def two_generations(store):
+    """Gen 1 on CONTENT_A (CID-G1), then re-register CONTENT_B, gen 2 (CID-G2)."""
+    did = store.create_drill("晨间过境演练", CONTENT_A)["id"]
+    r1 = store.compact(did, "CID-G1")
+    assert r1["generation"] == 1
+    seg_v1 = store._read_current(did)["segment"]
+    store.re_register_artifacts(did, CONTENT_B)
+    r2 = store.compact(did, "CID-G2")
+    assert r2["generation"] == 2
+    seg_v2 = store._read_current(did)["segment"]
+    assert seg_v2 != seg_v1
+    return did, seg_v1, seg_v2
+
+
+def test_clean_second_generation_sweeps_old_segment_at_reopen():
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did, seg_v1, seg_v2 = two_generations(st)
+        # a clean switch never sweeps early: the retired segment is collected
+        # by the next reopen's orphan pass, once every catalog is complete
+        assert set(list_segments(st)) == {seg_v1, seg_v2}
+        st2 = reopen(d)
+        assert list_segments(st2) == [seg_v2]
+        assert_one_complete_catalog(st2, did, 2)
+        # retired gen-1 catalog file remains as immutable audit history
+        assert os.path.exists(st2._catalog_path(did, 1))
+        statuses = {g["generation"]: g["status"]
+                    for g in st2.drill_view(did)["generations"]}
+        assert statuses == {1: "retired", 2: "active"}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_historical_cid_retransmit_after_reopen_returns_frozen_result():
+    """Gen1 -> gen2 -> reopen -> re-register gen-1 artifacts -> retransmit
+    the gen-1 id: frozen gen-1 result, nothing created, gen 2 stays active."""
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did, seg_v1, seg_v2 = two_generations(st)
+
+        # service reopen over the preserved data directory
+        st2 = reopen(d)
+        assert_one_complete_catalog(st2, did, 2)
+        assert list_segments(st2) == [seg_v2]
+        gen2_file = st2._catalog_path(did, 2)
+        with open(gen2_file, "rb") as fh:
+            gen2_bytes = fh.read()
+        audit_before = json.loads(json.dumps(
+            st2.registry["drills"][did].get("retired_consolidations", [])))
+        assert [r["consolidation_id"] for r in audit_before] == ["CID-G1"]
+
+        # re-register the first-generation artifact content
+        st2.re_register_artifacts(did, CONTENT_A)
+        # retransmit the earliest consolidation id
+        res = st2.compact(did, "CID-G1")
+        assert res["status"] == "active"
+        assert res["generation"] == 1
+        assert res["retransmission"] is True
+        # no extra generation, segment set does not grow, catalog not moved
+        assert_one_complete_catalog(st2, did, 2)
+        assert list_segments(st2) == [seg_v2]
+        statuses = {g["generation"]: g["status"]
+                    for g in st2.drill_view(did)["generations"]}
+        assert statuses == {1: "retired", 2: "active"}
+        # gen-2 catalog file and audit history untouched by the retransmit
+        with open(gen2_file, "rb") as fh:
+            assert fh.read() == gen2_bytes
+        assert st2.registry["drills"][did]["retired_consolidations"] == audit_before
+        # the gen-1 binding keeps its immutable first-freeze association
+        binding = st2.registry["bindings"]["CID-G1"]
+        assert binding["generation"] == 1
+        assert binding["segment"] == seg_v1
+        assert binding["artifact_names"] == ["工件A", "工件B"]
+
+        # once more: still the frozen result, still nothing created
+        again = st2.compact(did, "CID-G1")
+        assert again["generation"] == 1
+        assert list_segments(st2) == [seg_v2]
+        assert_one_complete_catalog(st2, did, 2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_historical_cid_with_different_content_rejected_catalog_retained():
+    """Same id + different artifact content: existing reject reason, the
+    current active catalog is retained — even after a reopen."""
+    d = tempfile.mkdtemp()
+    try:
+        st = Store(d)
+        did, _, seg_v2 = two_generations(st)
+        st2 = reopen(d)
+        segs = list_segments(st2)
+
+        # same artifact names, one fragment's content changed
+        st2.re_register_artifacts(did, [
+            {"name": "工件A", "fragments": [HEAD, "被篡改的片段", TAIL]},
+            {"name": "工件B", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+        ])
+        with pytest.raises(Rejected) as ei:
+            st2.compact(did, "CID-G1")
+        assert ei.value.code == "fragment_digest_mismatch"
+        assert st2._read_current(did)["generation"] == 2
+        assert list_segments(st2) == segs
+
+        # different artifact names (set differs)
+        st2.re_register_artifacts(did, [
+            {"name": "改名A", "fragments": [HEAD, "光谱基线 L=550", TAIL]},
+            {"name": "改名B", "fragments": [HEAD, "地形条带 A1 起伏 +3.2m", TAIL]},
+        ])
+        with pytest.raises(Rejected) as ei:
+            st2.compact(did, "CID-G1")
+        assert ei.value.code == "artifact_set_mismatch"
+        assert st2._read_current(did)["generation"] == 2
+        assert list_segments(st2) == segs
+
+        # the gen-2 id is unaffected and still returns its own generation
+        st2.re_register_artifacts(did, CONTENT_B)
+        res = st2.compact(did, "CID-G2")
+        assert res["generation"] == 2
+        assert st2._read_current(did)["generation"] == 2
+        assert list_segments(st2) == segs
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

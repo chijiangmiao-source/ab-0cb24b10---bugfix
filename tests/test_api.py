@@ -196,6 +196,90 @@ def test_rejection_first_reason_returned_and_active_retained(client):
     assert r1.json()["drill"]["active_generation"] is None
 
 
+def test_historical_consolidation_id_frozen_across_restart(client):
+    """Full scenario over HTTP with a real service restart in the middle:
+    two generations, restart on the preserved data dir, re-register the
+    first-generation artifacts, retransmit the first-generation id."""
+    c, data_dir, main = client
+    drill = create(c)
+    did = drill["id"]
+    r1 = c.post(f"/api/drills/{did}/compact",
+                json={"consolidation_id": "CID-HIST-1"})
+    assert r1.status_code == 200 and r1.json()["generation"] == 1
+
+    changed = {
+        "name": "晨间过境演练",
+        "artifacts": [
+            {"name": "光谱校准帧", "fragments": ["帧头V2", "光谱 640", "帧尾V2"]},
+            {"name": "地形条带A", "fragments": ["帧头V2", "地形 B4 -1.1m", "帧尾V2"]},
+            {"name": "云量速报", "fragments": ["帧头V2", "云量 23%", "帧尾V2"]},
+        ],
+    }
+    c.put(f"/api/drills/{did}/artifacts", json=changed).raise_for_status()
+    r2 = c.post(f"/api/drills/{did}/compact",
+                json={"consolidation_id": "CID-HIST-2"})
+    assert r2.status_code == 200 and r2.json()["generation"] == 2
+
+    # restart the service over the SAME preserved data directory
+    importlib.reload(main)
+    with TestClient(main.app) as c2:
+        assert c2.get("/health").json()["status"] == "ok"
+        view = c2.get(f"/api/drills/{did}").json()
+        assert view["active_generation"] == 2
+        # baseline after the restart: reopen only ever sweeps, never adds
+        segs_restart = view["segments"]
+        assert len(segs_restart) == 1
+
+        # re-register the first-generation artifacts, retransmit the first id
+        c2.put(f"/api/drills/{did}/artifacts", json=DEMO_DRILL).raise_for_status()
+        r = c2.post(f"/api/drills/{did}/compact",
+                    json={"consolidation_id": "CID-HIST-1"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["generation"] == 1
+        assert body["retransmission"] is True
+        view = body["drill"]
+        # no extra generation, segment set unchanged, active catalog kept
+        assert view["active_generation"] == 2
+        assert view["segments"] == segs_restart
+        statuses = {g["generation"]: g["status"] for g in view["generations"]}
+        assert statuses == {1: "retired", 2: "active"}
+
+        # again: still the frozen first-generation result, nothing created
+        r = c2.post(f"/api/drills/{did}/compact",
+                    json={"consolidation_id": "CID-HIST-1"})
+        assert r.json()["generation"] == 1
+        assert c2.get(f"/api/drills/{did}").json()["segments"] == segs_restart
+
+        # same id with different content: existing rejection, catalog kept
+        tampered = {
+            "name": "晨间过境演练",
+            "artifacts": [
+                {"name": "光谱校准帧",
+                 "fragments": ["帧头-S07", "光谱 550 被篡改", "帧尾-9F"]},
+                {"name": "地形条带A",
+                 "fragments": ["帧头-S07", "地形 A1 +3.2m", "帧尾-9F"]},
+                {"name": "云量速报",
+                 "fragments": ["帧头-S07", "云量 18%", "帧尾-9F"]},
+            ],
+        }
+        c2.put(f"/api/drills/{did}/artifacts", json=tampered).raise_for_status()
+        rj = c2.post(f"/api/drills/{did}/compact",
+                     json={"consolidation_id": "CID-HIST-1"})
+        assert rj.status_code == 409
+        assert rj.json()["reject"]["code"] == "fragment_digest_mismatch"
+        assert rj.json()["reject"]["active_generation"] == 2
+        assert rj.json()["drill"]["active_generation"] == 2
+        assert c2.get(f"/api/drills/{did}").json()["segments"] == segs_restart
+
+        # the second-generation id is unaffected by the historical traffic
+        c2.put(f"/api/drills/{did}/artifacts", json=changed).raise_for_status()
+        r = c2.post(f"/api/drills/{did}/compact",
+                    json={"consolidation_id": "CID-HIST-2"})
+        assert r.json()["generation"] == 2
+        assert c2.get(f"/api/drills/{did}").json()["segments"] == segs_restart
+
+
 def test_hard_crash_mode_process_restart(tmp_path, monkeypatch):
     """Hard mode exits the process; restarting must converge."""
     import subprocess

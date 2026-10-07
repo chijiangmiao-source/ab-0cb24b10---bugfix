@@ -23,6 +23,11 @@ Invariants enforced here:
   4. A reopen after an interruption at either crash point converges: missing
      segment content is retransmitted (content-addressed => the same segment
      id, never a new segment), then the switch/sweep finishes.
+  5. A consolidation id that once succeeded is bound forever: its binding
+     (first artifact digests, catalog generation, segment) is never deleted
+     or rewritten. Retransmitting a superseded id returns its frozen first
+     result — it creates no segment, no catalog generation and never moves
+     the active catalog backwards.
 """
 from __future__ import annotations
 
@@ -139,6 +144,7 @@ class Store:
             "recovered": [],
             "retransmitted": [],
             "swept": [],
+            "degraded": {},
         }
         self.recover_all()
 
@@ -588,7 +594,31 @@ class Store:
                 "active catalog retained",
                 "fragment_digest_mismatch",
             )
-        # Rejection reason #3: a required segment is missing and cannot be
+
+        cat = self._read_current(drill["id"])
+        if cat is None:
+            # Catalog pointer lost while bindings survived: republish the
+            # newest complete generation from durable state (never an older
+            # one) instead of creating anything new.
+            cat = self._repair_current(drill["id"])
+            if cat is None:
+                raise InvariantViolation(
+                    "no complete catalog recoverable after retransmit"
+                )
+
+        if binding["generation"] != cat["generation"]:
+            # Superseded (historical) consolidation id: its outcome is frozen
+            # in the durable binding. Return it verbatim — create no segment,
+            # no catalog generation, and never move the active catalog back.
+            return {
+                "status": "active",
+                "consolidation_id": consolidation_id,
+                "generation": binding["generation"],
+                "retransmission": True,
+            }
+
+        # The binding names the active generation: its segment must be
+        # present. Rejection reason #3: it is missing and cannot be
         # retransmitted because its bytes are unavailable locally.
         segid = binding["segment"]
         if not self._segment_valid(segid, {d for row in rows for d in row}):
@@ -600,15 +630,7 @@ class Store:
             wrote = self._write_segment(segid, fragment_bytes)
             if wrote:
                 self.last_recovery["retransmitted"].append(segid)
-
-        cat = self._read_current(drill["id"])
-        if cat is None:
-            # Catalog pointer lost while the binding survived: republish it
-            # from the durable binding instead of creating anything new.
-            cat = self._repair_from_binding(
-                drill["id"], binding, consolidation_id
-            )
-        if cat is None or self._verify_catalog(cat):
+        if self._verify_catalog(cat):
             raise InvariantViolation("bound catalog incomplete after retransmit")
         return {
             "status": "active",
@@ -616,6 +638,44 @@ class Store:
             "generation": binding["generation"],
             "retransmission": True,
         }
+
+    def _repair_current(self, drill_id: str) -> Optional[Dict[str, Any]]:
+        """Republish the active catalog pointer after its loss.
+
+        The newest complete generation wins — repair must never move the
+        active catalog backwards. Surviving catalog files come first; when
+        none verifies, the newest durable binding whose segment is intact
+        is rebuilt into a catalog file. Returns None when nothing complete
+        can be republished.
+        """
+        best: Optional[Dict[str, Any]] = None
+        prefix = f"{drill_id}-gen-"
+        for name in os.listdir(self.gen_dir):
+            if not (name.startswith(prefix) and name.endswith(".json")):
+                continue
+            try:
+                cat = read_json(os.path.join(self.gen_dir, name))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if cat.get("drill_id") != drill_id or self._verify_catalog(cat):
+                continue
+            if best is None or cat["generation"] > best["generation"]:
+                best = cat
+        if best is not None:
+            self._switch_current(drill_id, best["generation"])
+            return best
+        candidates = [
+            (cid, entry)
+            for cid, entry in self.registry["bindings"].items()
+            if entry.get("drill_id") == drill_id
+        ]
+        for cid, entry in sorted(
+            candidates, key=lambda item: item[1]["generation"], reverse=True
+        ):
+            cat = self._repair_from_binding(drill_id, entry, cid)
+            if cat is not None:
+                return cat
+        return None
 
     def _repair_from_binding(
         self, drill_id: str, binding: Dict[str, Any], consolidation_id: str
@@ -705,23 +765,25 @@ class Store:
             "artifact_names": wal["artifact_names"],
             "digest_rows": wal["digest_rows"],
         }
-        stale_bindings = [
-            cid
-            for cid, entry in self.registry["bindings"].items()
+        # Superseded consolidation ids keep their bindings forever: once an
+        # id has succeeded it immutably names its first frozen artifact set,
+        # generation and segment, so a later retransmission of it can never
+        # create a new generation. The supersession itself is recorded once
+        # in the drill's audit history (idempotent across WAL resumes).
+        retired = drill.setdefault("retired_consolidations", [])
+        recorded = {r.get("consolidation_id") for r in retired}
+        for cid, entry in sorted(self.registry["bindings"].items()):
             if (
                 entry.get("drill_id") == wal["drill_id"]
                 and entry.get("generation") != wal["generation"]
-            )
-        ]
-        retired_consolidations = drill.setdefault("retired_consolidations", [])
-        for cid in stale_bindings:
-            retired_consolidations.append({
-                "consolidation_id": cid,
-                "retired_at": utc_now(),
-            })
-            del self.registry["bindings"][cid]
-        if len(retired_consolidations) > 8:
-            drill["retired_consolidations"] = retired_consolidations[-8:]
+                and cid not in recorded
+            ):
+                retired.append({
+                    "consolidation_id": cid,
+                    "generation": entry.get("generation"),
+                    "retired_at": utc_now(),
+                })
+                recorded.add(cid)
         # Compact storage: source fragment text leaves the registry now that
         # the unique active catalog points durably into the segment.
         for art in drill["artifacts"]:
@@ -784,6 +846,7 @@ class Store:
                 "recovered": [],
                 "retransmitted": [],
                 "swept": [],
+                "degraded": {},
             }
             # Publish early so _resume's retransmission notes land in this report.
             self.last_recovery = report
@@ -822,14 +885,16 @@ class Store:
                 else:
                     report["swept"].extend(self._sweep_segments(orphans))
 
-            # Exactly one complete active catalog per consolidated drill.
+            # Exactly one active catalog per consolidated drill. A drill whose
+            # segment was lost after compaction is degraded, not inconsistent:
+            # keep the service up and surface the loss (recovery verdict and
+            # this report) instead of refusing to boot.
             for drill_id, drill in self.registry["drills"].items():
                 cat = self._read_current(drill_id)
                 if cat is not None:
-                    if self._verify_catalog(cat):
-                        raise InvariantViolation(
-                            f"active catalog for {drill_id} incomplete at reopen"
-                        )
+                    missing = self._verify_catalog(cat)
+                    if missing:
+                        report["degraded"][drill_id] = missing
                     drill["active_generation"] = cat["generation"]
                     drill["consolidation_id"] = cat["consolidation_id"]
             self._save_registry()
